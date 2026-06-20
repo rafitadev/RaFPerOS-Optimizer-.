@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RaFPerOS Extreme Optimizer</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+  <section class="hero"><div><p class="eyebrow">KernelSU WebUI • consentimento explícito</p><h1>RaFPerOS Extreme Optimizer</h1><p>Fluidez extrema para One UI, HyperOS e AOSP sem aplicar nada automaticamente. Ative toggles, pressione Aplicar e acompanhe os logs.</p></div><button id="boost">Boost manual</button></section>
+  <section class="grid"><article><h2>Dashboard</h2><pre id="status">Carregando...</pre></article><article><h2>Perfil</h2><div class="profiles"><button data-profile="ultra_smooth">Ultra Smooth</button><button data-profile="performance">Performance</button><button data-profile="balanced">Balanced</button><button data-profile="battery">Battery</button></div><p class="impact">Selecionar perfil não aplica tweaks. Use o botão Aplicar.</p><button class="apply" id="apply">Aplicar toggles ativos</button></article></section>
+  <div id="featureSections"></div>
+  <section class="reset"><h2>Reset total</h2><p>Restaura valores salvos de sysfs/procfs/propriedades/settings e remove políticas globais gerenciadas pelo módulo.</p><button class="danger" id="reset">Reset total</button></section>
+  <section><h2>Logs</h2><pre id="logs"></pre></section>
+</main><script src="app.js"></script></body></html>

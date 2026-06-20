@@ -114,6 +114,20 @@ A seção **Experience Enhancers** concentra opções manuais para sensação ge
 
 Todas essas opções permanecem OFF por padrão, exibem suporte detectado na WebUI e mostram aviso de risco quando agressivas.
 
+
+## Correção do fluxo WebUI → backend
+
+A WebUI agora usa uma ponte de execução real para o backend: primeiro tenta importar `exec` da API JavaScript do KernelSU (`kernelsu`), depois tenta fallbacks compatíveis (`window.ksu.exec` e `window.KSU.exec`). Cada toggle executa `rafperctl toggle <KEY> <0|1> apply`, ou seja: salva o estado persistente em `state/toggles.conf`, aplica imediatamente, atualiza o dashboard e mostra a saída da última ação. Opções sem suporte detectado ficam desabilitadas na UI, e falhas de aplicação aparecem nos logs como `SKIP`/`ERROR`.
+
+Fluxo validado:
+
+1. WebUI chama `rafperctl status` para ler estado real salvo.
+2. Toggle chama `rafperctl toggle KEY VALUE apply`.
+3. Backend grava `state/toggles.conf`.
+4. Backend executa `apply_all` somente para toggles ON.
+5. UI recarrega `status` e `logs`, exibindo o resultado real.
+6. `reset`/`reset-section` restauram backups e desligam toggles da seção.
+
 ## 9. Uso CLI
 
 ```sh

@@ -1,0 +1,135 @@
+#!/system/bin/sh
+# RaFPerOS Extreme Optimizer control plane. No tweak runs unless its toggle is enabled.
+MODDIR=${MODDIR:-$(cd "$(dirname "$0")/.." && pwd)}
+STATE="$MODDIR/state"; LOGD="$MODDIR/logs"; BACKUP="$MODDIR/backups"
+LOG="$LOGD/optimizer.log"; PROFILE_FILE="$STATE/profile"; TOGGLES="$STATE/toggles.conf"
+PROFILES="$MODDIR/common/profiles.conf"; DEFAULT_TOGGLES="$MODDIR/common/default_toggles.conf"
+mkdir -p "$STATE" "$LOGD" "$BACKUP"
+[ -f "$PROFILE_FILE" ] || echo performance > "$PROFILE_FILE"
+[ -f "$TOGGLES" ] || cp "$DEFAULT_TOGGLES" "$TOGGLES" 2>/dev/null
+ensure_defaults(){ while IFS= read -r line; do case "$line" in ""|\#*) continue;; *=*) k=${line%%=*}; grep -q "^$k=" "$TOGGLES" 2>/dev/null || echo "$line" >> "$TOGGLES";; esac; done < "$DEFAULT_TOGGLES"; }
+ensure_defaults
+
+log(){ echo "$(date '+%F %T') [$1] $2" >> "$LOG"; }
+emit(){ log "$1" "$2"; echo "[$1] $2"; }
+readf(){ [ -r "$1" ] && cat "$1" 2>/dev/null; }
+writable(){ [ -e "$1" ] && [ -w "$1" ]; }
+profile(){ cat "$PROFILE_FILE" 2>/dev/null; }
+key(){ awk -v s="[$1]" -v k="$2" 'BEGIN{f=0} $0==s{f=1;next} /^\[/{f=0} f&&$0~"^"k"="{sub("^[^=]*=","");print;exit}' "$PROFILES"; }
+toggle(){ . "$TOGGLES" 2>/dev/null; eval "v=\${$1:-0}"; [ "$v" = 1 ]; }
+bname(){ echo "$1" | sed 's#/#__#g; s#:#_prop_#g'; }
+backup(){ f="$1"; [ -e "$f" ] || return; b="$BACKUP/$(bname "$f")"; [ -f "$b" ] || readf "$f" > "$b"; }
+backup_prop(){ p="$1"; b="$BACKUP/prop_$(bname "$p")"; [ -f "$b" ] || getprop "$p" > "$b" 2>/dev/null; }
+write(){ f="$1"; v="$2"; [ -n "$v" ] || { log SKIP "$f empty_value"; return 1; }; writable "$f" || { log SKIP "$f unsupported"; return 1; }; backup "$f"; echo "$v" > "$f" 2>/dev/null && log APPLY "$f=$v" || log SKIP "$f write_failed"; }
+prop_set(){ p="$1"; v="$2"; command -v setprop >/dev/null 2>&1 || { log SKIP "$p setprop_missing"; return 1; }; backup_prop "$p"; setprop "$p" "$v" >/dev/null 2>&1 && log APPLY "$p=$v" || log SKIP "$p setprop_failed"; }
+first_supported(){ list="$1"; shift; for x in $list; do for f in "$@"; do grep -qw "$x" "$f" 2>/dev/null && { echo "$x"; return; }; done; done; }
+has_any(){ for f in "$@"; do [ -e "$f" ] && return 0; done; return 1; }
+count_glob(){ n=0; for f in "$@"; do [ -e "$f" ] && n=$((n+1)); done; echo "$n"; }
+has_cpufreq(){ has_any /sys/devices/system/cpu/cpufreq/policy*/scaling_governor /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; }
+has_gpu(){ has_any /sys/class/kgsl/kgsl-3d0 /sys/class/kgsl/kgsl-3d0/devfreq/governor /sys/class/devfreq/*gpu* /sys/class/devfreq/*mali* /sys/class/devfreq/*g3d* /sys/devices/platform/*mali* /sys/kernel/gpu; }
+has_input_boost(){ has_any /sys/module/cpu_boost/parameters/input_boost_ms /sys/module/cpu_boost/parameters/input_boost_freq /sys/module/cpu_input_boost/parameters/input_boost_ms /sys/kernel/cpu_input_boost/ib_duration_ms /sys/module/msm_performance/parameters/touchboost /sys/kernel/msm_performance/parameters/touchboost /sys/module/msm_performance/parameters/cpu_min_freq; }
+has_sched(){ has_any /dev/cpuset/top-app/cpus /dev/cpuset/foreground/cpus /dev/stune/top-app/schedtune.boost /dev/cpu.uclamp/top-app/cpu.uclamp.min /dev/cpuctl/top-app/cpu.uclamp.min; }
+
+support_one(){
+  case "$1" in
+    CPU_GOV|CPU_SCHEDUTIL|CPU_ANTI_OSC|CPU_SOFT_FREQ_LOCK) has_cpufreq && echo supported || echo unsupported ;;
+    CPU_UCLAMP) has_any /dev/cpu.uclamp/foreground/cpu.uclamp.min /dev/cpu.uclamp/top-app/cpu.uclamp.min /dev/cpuctl/foreground/cpu.uclamp.min /dev/cpuctl/top-app/cpu.uclamp.min && echo supported || echo unsupported ;;
+    CPU_CPUSET) has_any /dev/cpuset/foreground/cpus /dev/cpuset/top-app/cpus && echo supported || echo unsupported ;;
+    CPU_STUNE) has_any /dev/stune/foreground/schedtune.boost /dev/stune/top-app/schedtune.boost && echo supported || echo unsupported ;;
+    CPU_TOUCH_BOOST|INPUT_TOUCH|INPUT_FINGERPRINT) has_input_boost && echo supported || echo unsupported ;;
+    MEMORY_VM|MEMORY_DIRTY) has_any /proc/sys/vm/swappiness /proc/sys/vm/dirty_ratio && echo supported || echo unsupported ;;
+    MEMORY_ZRAM) has_any /sys/block/zram0 /sys/block/zram0/queue/read_ahead_kb && echo supported || echo unsupported ;;
+    MEMORY_LMKD|ADV_BACKGROUND) command -v cmd >/dev/null 2>&1 && echo supported || echo partial ;;
+    MEMORY_EXTREME) echo manual ;;
+    RENDER_HWUI|RENDER_SF) command -v setprop >/dev/null 2>&1 && echo supported || echo unsupported ;;
+    RENDER_ADVANCED) command -v setprop >/dev/null 2>&1 && echo advanced || echo unsupported ;;
+    RENDER_ANIMATIONS) command -v settings >/dev/null 2>&1 && echo supported || echo unsupported ;;
+    GPU_GOV|GPU_BOOST) has_gpu && echo supported || echo unsupported ;;
+    IO_SCHED|IO_LATENCY) [ -d /sys/block ] && echo supported || echo unsupported ;;
+    ADV_THERMAL) has_any /sys/class/thermal/thermal_message/sconfig /sys/devices/virtual/thermal/thermal_message/sconfig && echo supported || echo unsupported ;;
+    EXP_STEREO|EXP_AUDIO_BASS|EXP_AUDIO_VOICE|EXP_AUDIO_NORMALIZE|EXP_AUDIO_LIMITER|EXP_AUDIO_GAMING) command -v tinymix >/dev/null 2>&1 && echo supported || echo unsupported ;;
+    EXP_SMOOTHNESS|EXP_VISUAL_CONSISTENCY) command -v setprop >/dev/null 2>&1 && echo supported || echo unsupported ;;
+    EXP_TOUCH_RESPONSE|EXP_ANIMATION_BURST|EXP_APP_LAUNCH|EXP_GAME_SESSION) (has_input_boost || has_sched || has_gpu) && echo supported || echo unsupported ;;
+    EXP_FOREGROUND_PRIORITY|EXP_SESSION_BOOST) (has_sched || has_cpufreq) && echo supported || echo unsupported ;;
+    EXP_HAPTIC) has_any /sys/class/leds/vibrator/duration /sys/class/timed_output/vibrator/enable && echo supported || echo unsupported ;;
+    EXP_BRIGHTNESS_RESPONSE) has_any /sys/class/backlight/*/low_persistence /sys/class/backlight/*/hbm_mode /sys/class/backlight/*/acl && echo supported || echo unsupported ;;
+    EXP_NETWORK_LATENCY) has_any /proc/sys/net/ipv4/tcp_low_latency /proc/sys/net/ipv4/tcp_slow_start_after_idle && echo supported || echo unsupported ;;
+    APPLY_ON_BOOT) echo supported ;;
+    *) echo unknown ;;
+  esac
+}
+feature_note(){
+  case "$1" in
+    CPU_GOV) echo "cpufreq governor selection for faster ramp-up";; CPU_SCHEDUTIL) echo "schedutil/interactive latency knobs";; CPU_UCLAMP) echo "uclamp minimum utilization for foreground/top-app";; CPU_CPUSET) echo "foreground/top-app/background CPU affinity";; CPU_STUNE) echo "legacy schedtune foreground boost";; CPU_SOFT_FREQ_LOCK) echo "temporary min-frequency floor with timeout, not permanent max lock";; CPU_ANTI_OSC) echo "slower down-rate limit to reduce clock bouncing";; CPU_TOUCH_BOOST) echo "short CPU boost during interaction";; MEMORY_VM) echo "swappiness, watermarks and cache pressure";; MEMORY_ZRAM) echo "zRAM queue latency tuning";; MEMORY_DIRTY) echo "dirty writeback and flush timing";; MEMORY_LMKD) echo "LMK/LMKD app retention policy";; MEMORY_EXTREME) echo "manual high-risk memory aggression gate";; RENDER_HWUI) echo "HWUI/RenderEngine backend hints";; RENDER_SF) echo "SurfaceFlinger frame pacing hints";; RENDER_ADVANCED) echo "advanced composition debug props, risky";; RENDER_ANIMATIONS) echo "Android animation scale by profile";; GPU_GOV) echo "GPU devfreq/KGSL governor";; GPU_BOOST) echo "GPU pwrlevel/min-frequency burst";; IO_SCHED) echo "block scheduler selection";; IO_LATENCY) echo "read-ahead and low-latency queue knobs";; INPUT_TOUCH) echo "touch boost";; INPUT_FINGERPRINT) echo "unlock/fingerprint boost using same boost endpoints";; ADV_BACKGROUND) echo "ActivityManager cached process policy";; ADV_THERMAL) echo "vendor thermal performance mode only";; EXP_STEREO) echo "tinymix stereo widening if codec exposes a stereo control";; EXP_AUDIO_BASS) echo "tinymix bass enhancement control when exposed";; EXP_AUDIO_VOICE) echo "tinymix voice/dialog clarity control when exposed";; EXP_AUDIO_NORMALIZE) echo "tinymix volume normalization/DRC control when exposed";; EXP_AUDIO_LIMITER) echo "tinymix limiter control to reduce clipping when exposed";; EXP_AUDIO_GAMING) echo "tinymix low-latency/game audio path when exposed";; EXP_SMOOTHNESS) echo "combined frame pacing and animation smoothness hints";; EXP_TOUCH_RESPONSE) echo "touch response smoothing via boost endpoints";; EXP_ANIMATION_BURST) echo "short UI burst for app switch, shade and launcher transitions";; EXP_GAME_SESSION) echo "manual game session boost using enabled real endpoints";; EXP_FOREGROUND_PRIORITY) echo "foreground priority across cpuset/uclamp/stune";; EXP_VISUAL_CONSISTENCY) echo "prefer frame consistency over peak throughput via render hints";; EXP_SESSION_BOOST) echo "temporary active-use boost that relaxes by timeout";; EXP_APP_LAUNCH) echo "aggressive app launch burst using scheduler/input endpoints";; EXP_HAPTIC) echo "vibrator duration/enable boost when sysfs exposes it";; EXP_BRIGHTNESS_RESPONSE) echo "safe display response endpoints only, never raw brightness jumps";; EXP_NETWORK_LATENCY) echo "interactive TCP latency sysctls";; APPLY_ON_BOOT) echo "boot persistence switch; not kernel dependent and always available";; esac
+}
+support(){ for k in CPU_GOV CPU_SCHEDUTIL CPU_UCLAMP CPU_CPUSET CPU_STUNE CPU_SOFT_FREQ_LOCK CPU_ANTI_OSC CPU_TOUCH_BOOST MEMORY_VM MEMORY_ZRAM MEMORY_DIRTY MEMORY_LMKD MEMORY_EXTREME RENDER_HWUI RENDER_SF RENDER_ADVANCED RENDER_ANIMATIONS GPU_GOV GPU_BOOST IO_SCHED IO_LATENCY INPUT_TOUCH INPUT_FINGERPRINT ADV_BACKGROUND ADV_THERMAL EXP_STEREO EXP_AUDIO_BASS EXP_AUDIO_VOICE EXP_AUDIO_NORMALIZE EXP_AUDIO_LIMITER EXP_AUDIO_GAMING EXP_SMOOTHNESS EXP_TOUCH_RESPONSE EXP_ANIMATION_BURST EXP_GAME_SESSION EXP_FOREGROUND_PRIORITY EXP_VISUAL_CONSISTENCY EXP_SESSION_BOOST EXP_APP_LAUNCH EXP_HAPTIC EXP_BRIGHTNESS_RESPONSE EXP_NETWORK_LATENCY APPLY_ON_BOOT; do echo "$k:$(support_one "$k"):$(feature_note "$k")"; done; }
+
+cpu_policies(){ for pol in /sys/devices/system/cpu/cpufreq/policy* /sys/devices/system/cpu/cpu*/cpufreq; do [ -d "$pol" ] && echo "$pol"; done | awk '!seen[$0]++'; }
+apply_cpu(){
+  p="$1"; govs="$(key "$p" cpu_governors)"
+  for pol in $(cpu_policies); do
+    if toggle CPU_GOV; then gov=$(first_supported "$govs" "$pol/scaling_available_governors"); [ -n "$gov" ] && write "$pol/scaling_governor" "$gov"; fi
+    if toggle CPU_SCHEDUTIL; then write "$pol/schedutil/up_rate_limit_us" "$(key "$p" schedutil_up_rate_limit_us)"; write "$pol/interactive/timer_rate" "$(key "$p" interactive_timer_rate)"; write "$pol/interactive/go_hispeed_load" "$(key "$p" hispeed_load)"; fi
+    if toggle CPU_ANTI_OSC; then write "$pol/schedutil/down_rate_limit_us" "$(key "$p" anti_osc_down_rate_limit_us)"; else toggle CPU_SCHEDUTIL && write "$pol/schedutil/down_rate_limit_us" "$(key "$p" schedutil_down_rate_limit_us)"; fi
+    if toggle CPU_SOFT_FREQ_LOCK; then max=$(readf "$pol/cpuinfo_max_freq"); [ -n "$max" ] || max=$(readf "$pol/scaling_max_freq"); [ -n "$max" ] || { log SKIP "$pol soft_lock no max freq"; continue; }; min=$(( max * $(key "$p" soft_lock_ratio) / 100 )); write "$pol/scaling_min_freq" "$min"; ( sleep "$(key "$p" soft_lock_seconds)"; b="$BACKUP/$(bname "$pol/scaling_min_freq")"; [ -f "$b" ] && cat "$b" > "$pol/scaling_min_freq" 2>/dev/null && log RESTORE "$pol/scaling_min_freq soft-lock timeout" ) & fi
+  done
+}
+apply_sched(){
+  p="$1"
+  toggle CPU_CPUSET && { write /dev/cpuset/foreground/cpus "$(key "$p" fg_cpuset)"; write /dev/cpuset/top-app/cpus "$(key "$p" top_cpuset)"; write /dev/cpuset/background/cpus "$(key "$p" bg_cpuset)"; }
+  toggle CPU_STUNE && { write /dev/stune/foreground/schedtune.boost "$(key "$p" stune_fg_boost)"; write /dev/stune/top-app/schedtune.boost "$(key "$p" stune_top_boost)"; write /dev/stune/background/schedtune.prefer_idle 0; }
+  toggle CPU_UCLAMP && { write /dev/cpu.uclamp/foreground/cpu.uclamp.min "$(key "$p" uclamp_fg_min)"; write /dev/cpu.uclamp/top-app/cpu.uclamp.min "$(key "$p" uclamp_top_min)"; write /dev/cpuctl/foreground/cpu.uclamp.min "$(key "$p" uclamp_fg_min)"; write /dev/cpuctl/top-app/cpu.uclamp.min "$(key "$p" uclamp_top_min)"; }
+}
+apply_input(){
+  p="$1"; (toggle CPU_TOUCH_BOOST || toggle INPUT_TOUCH || toggle INPUT_FINGERPRINT) || return; ms="$(key "$p" input_boost_ms)"
+  for f in /sys/module/cpu_boost/parameters/input_boost_ms /sys/module/cpu_input_boost/parameters/input_boost_ms /sys/kernel/cpu_input_boost/ib_duration_ms /sys/module/msm_performance/parameters/touchboost; do write "$f" "$ms"; done
+  for f in /sys/module/cpu_boost/parameters/input_boost_enabled /sys/module/cpu_input_boost/parameters/enabled /sys/kernel/cpu_input_boost/enabled /sys/kernel/msm_performance/parameters/touchboost /sys/module/msm_performance/parameters/touchboost; do write "$f" 1; done
+}
+apply_memory(){
+  p="$1"
+  toggle MEMORY_EXTREME && log INFO "manual MEMORY_EXTREME gate enabled by user"
+  toggle MEMORY_VM && { write /proc/sys/vm/swappiness "$(key "$p" swappiness)"; write /proc/sys/vm/watermark_scale_factor "$(key "$p" watermark_scale_factor)"; write /proc/sys/vm/vfs_cache_pressure "$(key "$p" vfs_cache_pressure)"; }
+  toggle MEMORY_DIRTY && { write /proc/sys/vm/dirty_ratio "$(key "$p" dirty_ratio)"; write /proc/sys/vm/dirty_background_ratio "$(key "$p" dirty_background_ratio)"; write /proc/sys/vm/dirty_expire_centisecs "$(key "$p" dirty_expire_centisecs)"; write /proc/sys/vm/dirty_writeback_centisecs "$(key "$p" dirty_writeback_centisecs)"; }
+  toggle MEMORY_ZRAM && for z in /sys/block/zram*/queue/read_ahead_kb; do [ -e "$z" ] && write "$z" "$(key "$p" zram_read_ahead_kb)"; done
+  toggle MEMORY_LMKD && { write /sys/module/lowmemorykiller/parameters/minfree "$(key "$p" lmk_minfree)"; write /sys/module/lowmemorykiller/parameters/enable_adaptive_lmk 1; command -v cmd >/dev/null 2>&1 && cmd device_config put activity_manager max_cached_processes "$(key "$p" max_cached_processes)" >/dev/null 2>&1 && log APPLY "activity_manager.max_cached_processes=$(key "$p" max_cached_processes)"; }
+}
+apply_render(){
+  p="$1"
+  toggle RENDER_HWUI && { prop_set debug.hwui.renderer skiagl; prop_set debug.renderengine.backend skiaglthreaded; }
+  toggle RENDER_SF && { prop_set debug.sf.enable_gl_backpressure 1; prop_set debug.sf.latch_unsignaled 1; }
+  toggle RENDER_ADVANCED && { log INFO "advanced render props enabled by user"; prop_set debug.sf.disable_client_composition 0; prop_set debug.sf.disable_hwc 0; prop_set debug.composition.type dyn; }
+  if toggle RENDER_ANIMATIONS; then s="$(key "$p" animation_scale)"; for k in window_animation_scale transition_animation_scale animator_duration_scale; do b="$BACKUP/settings_$k"; [ -f "$b" ] || settings get global "$k" > "$b" 2>/dev/null; settings put global "$k" "$s" >/dev/null 2>&1 && log APPLY "settings.global.$k=$s" || log SKIP "settings.global.$k failed"; done; fi
+}
+apply_gpu(){
+  p="$1"; govs="$(key "$p" gpu_governors)"
+  for d in /sys/class/kgsl/kgsl-3d0 /sys/devices/platform/*kgsl-3d0*; do [ -d "$d" ] || continue; toggle GPU_BOOST && { write "$d/force_clk_on" 1; write "$d/force_bus_on" 1; write "$d/default_pwrlevel" "$(key "$p" gpu_min_pwrlevel)"; write "$d/min_pwrlevel" "$(key "$p" gpu_min_pwrlevel)"; maxf=$(readf "$d/devfreq/available_frequencies" | awk '{print $NF}'); [ -n "$maxf" ] && write "$d/devfreq/min_freq" "$maxf"; }; toggle GPU_GOV && { gov=$(first_supported "$govs" "$d/devfreq/available_governors"); [ -n "$gov" ] && write "$d/devfreq/governor" "$gov"; }; done
+  toggle GPU_GOV && for f in /sys/class/devfreq/*gpu*/governor /sys/class/devfreq/*mali*/governor /sys/class/devfreq/*g3d*/governor; do [ -e "$f" ] || continue; dir=${f%/*}; gov=$(first_supported "$govs" "$dir/available_governors"); [ -n "$gov" ] && write "$f" "$gov"; maxf=$(readf "$dir/available_frequencies" | awk '{print $NF}'); toggle GPU_BOOST && [ -n "$maxf" ] && write "$dir/min_freq" "$maxf"; done
+}
+apply_io(){ p="$1"; for q in /sys/block/*/queue; do [ -d "$q" ] || continue; if toggle IO_SCHED; then sched=$(first_supported "$(key "$p" io_schedulers)" "$q/scheduler"); [ -n "$sched" ] && write "$q/scheduler" "$sched"; fi; toggle IO_LATENCY && { write "$q/read_ahead_kb" "$(key "$p" read_ahead_kb)"; write "$q/iostats" 0; write "$q/iosched/low_latency" 1; write "$q/iosched/slice_idle" 0; }; done; }
+apply_advanced(){ p="$1"; toggle ADV_BACKGROUND && command -v cmd >/dev/null 2>&1 && cmd device_config put activity_manager max_cached_processes "$(key "$p" max_cached_processes)" >/dev/null 2>&1 && log APPLY "background cache policy=$(key "$p" max_cached_processes)"; toggle ADV_THERMAL && { for f in /sys/class/thermal/thermal_message/sconfig /sys/devices/virtual/thermal/thermal_message/sconfig; do [ -e "$f" ] && write "$f" "$(key "$p" thermal_mode)"; done; }; }
+
+tinymix_set(){ pattern="$1"; value="$2"; command -v tinymix >/dev/null 2>&1 || { log SKIP "tinymix missing for $pattern"; return; }; ctl=$(tinymix 2>/dev/null | awk -v p="$pattern" 'BEGIN{IGNORECASE=1} $0~p{print $1; exit}'); [ -n "$ctl" ] || { log SKIP "audio control not found: $pattern"; return; }; tinymix "$ctl" "$value" >/dev/null 2>&1 && log APPLY "tinymix[$pattern]=$value" || log SKIP "tinymix[$pattern] failed"; }
+audio_level_value(){ case "$1" in strong) echo 3;; medium) echo 2;; light) echo 1;; *) echo 1;; esac; }
+apply_audio(){ p="$1"; level=$(audio_level_value "$(key "$p" stereo_widen)"); bass=$(audio_level_value "$(key "$p" bass_boost)"); voice=$(audio_level_value "$(key "$p" voice_clarity)"); toggle EXP_STEREO && tinymix_set "stereo|widen|spatial" "$level"; toggle EXP_AUDIO_BASS && tinymix_set "bass|xbass" "$bass"; toggle EXP_AUDIO_VOICE && tinymix_set "voice|dialog|clarity" "$voice"; toggle EXP_AUDIO_NORMALIZE && tinymix_set "normal|drc|dynamic" 1; toggle EXP_AUDIO_LIMITER && tinymix_set "limit|clip" 1; toggle EXP_AUDIO_GAMING && tinymix_set "game|low.*latency|fast" 1; }
+apply_experience(){
+  p="$1"
+  if toggle EXP_SMOOTHNESS; then prop_set debug.sf.enable_gl_backpressure 1; prop_set debug.hwui.use_hint_manager true; fi
+  if toggle EXP_VISUAL_CONSISTENCY; then prop_set debug.sf.latch_unsignaled 1; prop_set debug.sf.enable_hwc_vds 1; fi
+  if toggle EXP_TOUCH_RESPONSE || toggle EXP_APP_LAUNCH || toggle EXP_ANIMATION_BURST || toggle EXP_GAME_SESSION; then ms="$(key "$p" input_boost_ms)"; for f in /sys/module/cpu_boost/parameters/input_boost_ms /sys/module/cpu_input_boost/parameters/input_boost_ms /sys/kernel/cpu_input_boost/ib_duration_ms /sys/module/msm_performance/parameters/touchboost; do write "$f" "$ms"; done; for f in /sys/module/cpu_boost/parameters/input_boost_enabled /sys/module/cpu_input_boost/parameters/enabled /sys/kernel/cpu_input_boost/enabled /sys/kernel/msm_performance/parameters/touchboost /sys/module/msm_performance/parameters/touchboost; do write "$f" 1; done; fi
+  if toggle EXP_ANIMATION_BURST || toggle EXP_FOREGROUND_PRIORITY || toggle EXP_APP_LAUNCH || toggle EXP_GAME_SESSION; then write /dev/stune/top-app/schedtune.boost "$(key "$p" stune_top_boost)"; write /dev/cpu.uclamp/top-app/cpu.uclamp.min "$(key "$p" uclamp_top_min)"; write /dev/cpuset/top-app/cpus "$(key "$p" top_cpuset)"; fi
+  if toggle EXP_GAME_SESSION; then govs="$(key "$p" gpu_governors)"; for d in /sys/class/kgsl/kgsl-3d0 /sys/devices/platform/*kgsl-3d0*; do [ -d "$d" ] || continue; write "$d/force_clk_on" 1; write "$d/force_bus_on" 1; write "$d/min_pwrlevel" "$(key "$p" gpu_min_pwrlevel)"; maxf=$(readf "$d/devfreq/available_frequencies" | awk '{print $NF}'); [ -n "$maxf" ] && write "$d/devfreq/min_freq" "$maxf"; gov=$(first_supported "$govs" "$d/devfreq/available_governors"); [ -n "$gov" ] && write "$d/devfreq/governor" "$gov"; done; fi
+  if toggle EXP_SESSION_BOOST; then for pol in $(cpu_policies); do max=$(readf "$pol/cpuinfo_max_freq"); [ -n "$max" ] || max=$(readf "$pol/scaling_max_freq"); [ -n "$max" ] || { log SKIP "$pol soft_lock no max freq"; continue; }; min=$(( max * $(key "$p" soft_lock_ratio) / 100 )); write "$pol/scaling_min_freq" "$min"; write "$pol/schedutil/down_rate_limit_us" "$(key "$p" anti_osc_down_rate_limit_us)"; ( sleep "$(key "$p" soft_lock_seconds)"; b="$BACKUP/$(bname "$pol/scaling_min_freq")"; [ -f "$b" ] && cat "$b" > "$pol/scaling_min_freq" 2>/dev/null && log RESTORE "$pol/scaling_min_freq session timeout" ) & done; fi
+  toggle EXP_HAPTIC && { ms="$(key "$p" haptic_boost_ms)"; write /sys/class/leds/vibrator/duration "$ms"; write /sys/class/timed_output/vibrator/enable "$ms"; }
+  toggle EXP_BRIGHTNESS_RESPONSE && { for f in /sys/class/backlight/*/low_persistence /sys/class/backlight/*/hbm_mode; do [ -e "$f" ] && write "$f" 1; done; for f in /sys/class/backlight/*/acl; do [ -e "$f" ] && write "$f" 0; done; }
+  toggle EXP_NETWORK_LATENCY && { write /proc/sys/net/ipv4/tcp_low_latency 1; write /proc/sys/net/ipv4/tcp_slow_start_after_idle 0; }
+}
+
+apply_all(){ p="$(profile)"; emit INFO "apply_start profile=$p reason=$1"; apply_audio "$p"; apply_experience "$p"; apply_cpu "$p"; apply_sched "$p"; apply_input "$p"; apply_memory "$p"; apply_render "$p"; apply_gpu "$p"; apply_io "$p"; apply_advanced "$p"; emit INFO "apply_done profile=$p"; tail -n 40 "$LOG" 2>/dev/null; }
+reset_all(){ emit INFO "reset_start reason=$1"; for b in "$BACKUP"/*; do [ -f "$b" ] || continue; base=$(basename "$b"); case "$base" in prop_*) prop=${base#prop_}; prop=$(echo "$prop"|sed 's#_prop_#:#g; s#__#/#g'); prop_set "$prop" "$(cat "$b")";; settings_*) k=${base#settings_}; settings put global "$k" "$(cat "$b")" >/dev/null 2>&1 && log RESTORE "settings.global.$k";; *) f=$(echo "$base"|sed 's#__#/#g'); writable "$f" && cat "$b" > "$f" 2>/dev/null && log RESTORE "$f";; esac; done; command -v cmd >/dev/null 2>&1 && cmd device_config delete activity_manager max_cached_processes >/dev/null 2>&1; emit INFO reset_done; }
+reset_section(){ sec="$1"; case "$sec" in cpu) keys="CPU_GOV CPU_SCHEDUTIL CPU_UCLAMP CPU_CPUSET CPU_STUNE CPU_SOFT_FREQ_LOCK CPU_ANTI_OSC CPU_TOUCH_BOOST";; memory) keys="MEMORY_VM MEMORY_ZRAM MEMORY_DIRTY MEMORY_LMKD MEMORY_EXTREME";; render) keys="RENDER_HWUI RENDER_SF RENDER_ADVANCED RENDER_ANIMATIONS";; gpu) keys="GPU_GOV GPU_BOOST";; io) keys="IO_SCHED IO_LATENCY";; input) keys="INPUT_TOUCH INPUT_FINGERPRINT";; advanced) keys="ADV_BACKGROUND ADV_THERMAL APPLY_ON_BOOT";; experience) keys="EXP_STEREO EXP_AUDIO_BASS EXP_AUDIO_VOICE EXP_AUDIO_NORMALIZE EXP_AUDIO_LIMITER EXP_AUDIO_GAMING EXP_SMOOTHNESS EXP_TOUCH_RESPONSE EXP_ANIMATION_BURST EXP_GAME_SESSION EXP_FOREGROUND_PRIORITY EXP_VISUAL_CONSISTENCY EXP_SESSION_BOOST EXP_APP_LAUNCH EXP_HAPTIC EXP_BRIGHTNESS_RESPONSE EXP_NETWORK_LATENCY";; audio) keys="EXP_STEREO EXP_AUDIO_BASS EXP_AUDIO_VOICE EXP_AUDIO_NORMALIZE EXP_AUDIO_LIMITER EXP_AUDIO_GAMING";; extras) keys="EXP_HAPTIC EXP_BRIGHTNESS_RESPONSE EXP_NETWORK_LATENCY EXP_GAME_SESSION";; *) echo invalid_section; exit 2;; esac; for k in $keys; do grep -q "^$k=" "$TOGGLES" && sed -i "s/^$k=.*/$k=0/" "$TOGGLES"; done; log INFO "section_reset $sec toggles_off"; reset_all "section_$sec"; }
+status(){ p="$(profile)"; echo "profile=$p"; echo "label=$(key "$p" label)"; echo "kernel=$(uname -r)"; echo "device=$(getprop ro.product.device 2>/dev/null)"; echo "manufacturer=$(getprop ro.product.manufacturer 2>/dev/null)"; echo "rom=$(getprop ro.build.version.incremental 2>/dev/null)"; echo "soc=$(getprop ro.board.platform 2>/dev/null)"; echo "cpu_policies=$(count_glob /sys/devices/system/cpu/cpufreq/policy*)"; echo "gpu_nodes=$(count_glob /sys/class/kgsl/kgsl-3d0 /sys/class/devfreq/*gpu* /sys/class/devfreq/*mali* /sys/class/devfreq/*g3d* /sys/kernel/gpu)"; echo "zram_nodes=$(count_glob /sys/block/zram*)"; cat "$TOGGLES"; echo "--- support ---"; support; }
+set_profile(){ case "$1" in ultra_smooth|performance|balanced|battery) echo "$1" > "$PROFILE_FILE"; emit INFO "profile=$1 saved (press Apply or enable apply argument)";; *) echo invalid_profile; exit 2;; esac; }
+set_toggle(){ k="$1"; v="$2"; mode="$3"; case "$v" in 0|1) ;; *) echo "toggle value must be 0 or 1"; exit 2;; esac; grep -q "^$k=" "$TOGGLES" && sed -i "s/^$k=.*/$k=$v/" "$TOGGLES" || echo "$k=$v" >> "$TOGGLES"; emit INFO "toggle $k=$v saved"; [ "$mode" = apply ] && apply_all "toggle_$k"; }
+boost_now(){ p="$(profile)"; log INFO short_touch_unlock_boost; apply_input "$p"; apply_sched "$p"; apply_gpu "$p"; }
+daemon(){ log INFO daemon_start; last=""; while true; do wake=$(dumpsys power 2>/dev/null | awk -F= '/mWakefulness=/{print $2; exit}'); if [ "$wake" = Awake ] && [ "$last" != Awake ]; then boost_now; fi; last="$wake"; sleep 5; done; }
+case "$1" in apply) apply_all "$2";; reset) reset_all "$2";; reset-section) reset_section "$2";; status) status;; support) support;; profile) [ -n "$2" ] && set_profile "$2" || profile;; toggle) set_toggle "$2" "$3" "$4";; boost) boost_now; tail -n 40 "$LOG" 2>/dev/null;; logs) tail -n "${2:-220}" "$LOG" 2>/dev/null;; daemon) daemon;; *) echo "usage: rafperctl {apply|reset|reset-section|status|support|profile|toggle|boost|logs|daemon}"; exit 1;; esac

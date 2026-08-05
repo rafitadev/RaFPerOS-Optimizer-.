@@ -1,0 +1,6 @@
+id=rafperos_extreme_optimizer
+name=RaFPerOS Extreme Optimizer
+author=RaFPerOS / OpenAI
+description=KernelSU performance tuning module with aggressive, profile-based latency optimizations and WebUI controls.
+version=1.0.0
+versionCode=100
